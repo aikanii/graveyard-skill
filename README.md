@@ -35,19 +35,6 @@ It also separates the **finished** (deployed, pushed, documented; done, not aban
 - **Relapse watch**: resurrections are recorded (`--state` + `--mark-resurrected`); every later scan reports whether the patient is holding.
 - **Necromancer mode**: ask your agent to build something new and it checks the graveyard first; you may have built 60% of it in 2024.
 
-## Install (10 seconds)
-
-```bash
-npx skills add https://github.com/Shubhamsaboo/awesome-llm-apps/tree/main/agent_skills/project-graveyard
-```
-
-The [skills CLI](https://skills.sh) installs it into whatever agents you have (Claude Code, Codex, Cursor, Copilot, Antigravity, and others); or copy this folder into your agent's skills dir. Then: *"run the graveyard on ~/dev and ~/projects"*.
-
-Standalone, no agent required:
-
-```bash
-python3 project-graveyard/scripts/graveyard.py ~/dev ~/projects
-```
 
 ## Scope and privacy
 

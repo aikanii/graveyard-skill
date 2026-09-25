@@ -57,5 +57,3 @@ project-graveyard/                  # ← this is all that gets copied
 ├── scripts/graveyard.py            # scanner + autopsy + pulse ranking (Python 3.8+, stdlib, offline)
 └── references/causes-of-death.md   # the taxonomy: signals, confidence, resurrection strategy per cause
 ```
-
-Part of [awesome-llm-apps](https://github.com/Shubhamsaboo/awesome-llm-apps) · Apache-2.0 · Last verified: July 2026

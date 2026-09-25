@@ -10,7 +10,7 @@ description: >-
 license: Apache-2.0
 compatibility: Python 3.8+ and Git; scanner is local, offline, and stdlib-only.
 metadata:
-  author: "Shubham Saboo"
+  author: "MJ"
   version: "1.1.0"
   source: "https://github.com/aikanii/graveyard-skill"
 ---

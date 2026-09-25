@@ -15,7 +15,8 @@ Usage:
     python3 graveyard.py --days 90                    # custom "dead" threshold
     python3 graveyard.py --include-foreign             # include repos you didn't author
 
-Python 3.8+, stdlib only. Read-only: never writes inside scanned repos.
+Python 3.8+, stdlib only. Never mutates repositories; writes only explicit
+--json and --state paths.
 """
 
 import argparse
@@ -24,8 +25,11 @@ import os
 import statistics
 import subprocess
 import sys
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime
 from pathlib import Path
+
+__version__ = "1.1.0"
 
 DEFAULT_ROOTS = ["~/dev", "~/projects", "~/code", "~/src", "~/Desktop", "~/Documents/GitHub", "~/Downloads"]
 SKIP_DIRS = {"node_modules", ".venv", "venv", ".tox", "vendor", ".cache", "Library",
@@ -33,15 +37,20 @@ SKIP_DIRS = {"node_modules", ".venv", "venv", ".tox", "vendor", ".cache", "Libra
 MAX_DEPTH = 4
 
 CONFIG_FILES = {
-    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "tsconfig.json",
-    "webpack.config.js", "vite.config.js", "vite.config.ts", "babel.config.js",
-    ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".prettierrc", "jest.config.js",
-    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile",
-    "Dockerfile", "docker-compose.yml", ".gitignore", "Makefile", ".env.example",
-    "tailwind.config.js", "postcss.config.js", "next.config.js", "next.config.mjs",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+    "bun.lockb", "tsconfig.json", "webpack.config.js", "vite.config.js",
+    "vite.config.ts", "vite.config.mjs", "babel.config.js", ".eslintrc",
+    ".eslintrc.js", ".eslintrc.json", "eslint.config.js", "eslint.config.mjs",
+    ".prettierrc", "jest.config.js", "requirements.txt", "pyproject.toml",
+    "setup.py", "setup.cfg", "Pipfile", "poetry.lock", "uv.lock", "go.mod",
+    "go.sum", "Cargo.toml", "Cargo.lock", "Dockerfile", "compose.yml",
+    "compose.yaml", "docker-compose.yml", "docker-compose.yaml", ".gitignore",
+    "Makefile", ".env.example", "tailwind.config.js", "tailwind.config.ts",
+    "postcss.config.js", "next.config.js", "next.config.mjs",
 }
 DEPLOY_MARKERS = ["vercel.json", "netlify.toml", "fly.toml", "render.yaml", "Procfile",
-                  "app.yaml", "wrangler.toml", "railway.json", ".github/workflows"]
+                  "app.yaml", "wrangler.toml", "railway.json", "firebase.json",
+                  "serverless.yml", "serverless.yaml", ".github/workflows"]
 AUTH_HINTS = ("auth", "oauth", "login", "signup", "session", "clerk", "passport",
               "jwt", "next-auth", "supabase-auth")
 PAYMENT_HINTS = ("stripe", "billing", "payment", "checkout", "subscription", "paddle",
@@ -61,16 +70,17 @@ def sh(args, cwd=None):
         return ""
 
 
-def find_repos(roots):
+def find_repos(roots, max_depth=MAX_DEPTH):
+    """Find Git worktrees below roots without traversing metadata/cache dirs."""
     repos = []
     for root in roots:
-        root = Path(os.path.expanduser(root))
+        root = Path(os.path.expanduser(str(root)))
         if not root.is_dir():
             continue
         base_depth = len(root.parts)
-        for dirpath, dirs, _files in os.walk(root):
+        for dirpath, dirs, _files in os.walk(str(root)):
             p = Path(dirpath)
-            if len(p.parts) - base_depth > MAX_DEPTH:
+            if len(p.parts) - base_depth > max_depth:
                 dirs[:] = []
                 continue
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -97,22 +107,23 @@ PROJECT_MARKERS = {"package.json", "pyproject.toml", "requirements.txt", "go.mod
                    "Cargo.toml", "Gemfile", "composer.json", "index.html"}
 
 
-def find_unversioned(roots, repo_paths):
-    """Project folders with no git anywhere — dead before their first commit.
+def find_unversioned(roots, repo_paths, max_depth=MAX_DEPTH):
+    """Find marker-bearing project folders that are not inside a Git repo.
 
-    A dir counts if it has a project marker file, is not inside any git repo,
-    and is not nested inside another unversioned project already found.
+    A directory counts if it has a project marker file, is not inside any Git
+    repository, and is not nested inside another unversioned project already
+    found. Symlinked trees are not followed.
     """
     found = []
     repo_strs = [str(r) for r in repo_paths]
     for root in roots:
-        root = Path(os.path.expanduser(root))
+        root = Path(os.path.expanduser(str(root)))
         if not root.is_dir():
             continue
         base_depth = len(root.parts)
-        for dirpath, dirs, files in os.walk(root):
+        for dirpath, dirs, files in os.walk(str(root)):
             p = Path(dirpath)
-            if len(p.parts) - base_depth > MAX_DEPTH:
+            if len(p.parts) - base_depth > max_depth:
                 dirs[:] = []
                 continue
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -120,15 +131,29 @@ def find_unversioned(roots, repo_paths):
             if any(rp == r or rp.startswith(r + os.sep) for r in repo_strs):
                 dirs[:] = []  # inside a git repo; its files belong to that story
                 continue
-            if p != root and PROJECT_MARKERS & set(files) and not (p / ".git").exists():
+            if PROJECT_MARKERS & set(files) and not (p / ".git").exists():
                 found.append(p.resolve())
                 dirs[:] = []  # don't count a project's subfolders as more projects
     return sorted(set(found))
 
 
+def has_path_marker(files, marker):
+    """Return whether marker exists at the root or in a nested package."""
+    marker = marker.strip("/")
+    for filename in files:
+        clean = filename.strip("/")
+        if clean == marker or clean.startswith(marker + "/"):
+            return True
+        if clean.endswith("/" + marker) or ("/" + marker + "/") in ("/" + clean):
+            return True
+    return False
+
+
 def read_repo(path, my_emails):
-    """Pull the facts out of one repo. Fast git commands only, read-only."""
-    log = sh(["git", "log", "--format=%at|%ae|%s", "--no-merges"], cwd=path)
+    """Pull facts out of one repository using fast, read-only Git commands."""
+    # Committer time represents when work landed in this repository; author
+    # time can remain years old after a recent cherry-pick or rebase.
+    log = sh(["git", "log", "--format=%ct|%ae|%s", "--no-merges"], cwd=path)
     if not log:
         return None
     commits = []
@@ -143,8 +168,17 @@ def read_repo(path, my_emails):
         return None
     commits.sort(key=lambda c: c["at"])
 
-    mine = (sum(1 for c in commits if c["email"].lower() in my_emails)
-            if my_emails else len(commits))
+    # A repository may intentionally override the global Git identity. Treat
+    # that local-only address as another identity belonging to the user; this
+    # avoids dropping old work-account projects unless --include-foreign is
+    # used. Do not use inherited config here because it is already collected
+    # once by main().
+    recognized_emails = set(my_emails)
+    local_email = sh(["git", "config", "--local", "--get", "user.email"], cwd=path)
+    if local_email:
+        recognized_emails.add(local_email.strip().lower())
+    mine = (sum(1 for c in commits if c["email"].strip().lower() in recognized_emails)
+            if recognized_emails else len(commits))
     remote = sh(["git", "remote", "get-url", "origin"], cwd=path)
 
     files = sh(["git", "ls-files"], cwd=path).splitlines()
@@ -154,9 +188,7 @@ def read_repo(path, my_emails):
     # files touched by the last 3 commits — where it died
     last_touched = sh(["git", "log", "-3", "--name-only", "--format="], cwd=path).lower()
 
-    has_deploy = any(
-        m in files or any(f.startswith(m) for f in files) for m in DEPLOY_MARKERS
-    )
+    has_deploy = any(has_path_marker(files, marker) for marker in DEPLOY_MARKERS)
     has_tests = any("test" in f.lower() or "spec" in f.lower() for f in files)
     has_tags = bool(sh(["git", "tag", "--list"], cwd=path))
     has_readme = any(n.lower().startswith("readme") for n in file_names)
@@ -176,6 +208,7 @@ def read_repo(path, my_emails):
         "last": commits[-1]["at"],
         "commits": len(commits),
         "mine": mine,
+        "ownership_known": bool(recognized_emails),
         "messages": [c["msg"] for c in commits],
         "remote": remote,
         "files": len(files),
@@ -219,7 +252,7 @@ def autopsy(repo, all_repos):
         findings.append((
             "shiny_object",
             "killed by `%s`, whose first commit came %d day(s) after this repo's last"
-            % (killer["name"], max(1, kgap // 86400)),
+            % (killer["name"], max(0, kgap // 86400)),
         ))
 
     last = repo["last_touched"]
@@ -235,8 +268,8 @@ def autopsy(repo, all_repos):
             % round(repo["config_ratio"] * 100),
         ))
 
-    if (repo["has_readme"] and repo["commits"] >= 20 and not repo["has_deploy"]
-            and not repo["has_tags"]):  # tagged releases = it shipped, just not as a deployment
+    if (repo["has_readme"] and repo["commits"] >= 20 and repo["config_ratio"] < 0.6
+            and not repo["has_deploy"] and not repo["has_tags"]):  # a tagged release shipped
         findings.append((
             "deploy_fear",
             "README written, %d commits in, tests %s, and no deploy config anywhere. "
@@ -252,7 +285,7 @@ def autopsy(repo, all_repos):
             % len(rewrite_msgs),
         ))
 
-    if repo["files"] > 100 and not repo["has_deploy"] and lifespan_days(repo) > 30:
+    if repo["files"] >= 100 and not repo["has_deploy"] and lifespan_days(repo) > 30:
         findings.append((
             "scope_explosion",
             "%d files across %d top-level directories, zero deploy config — it grew instead of shipping"
@@ -261,7 +294,7 @@ def autopsy(repo, all_repos):
 
     if not findings and len(repo["gaps"]) >= 3:
         med = statistics.median(repo["gaps"])
-        if med and repo["gaps"][-1] > 3 * med:
+        if med and repo["gaps"][-1] >= 3 * med:
             findings.append((
                 "slow_fade",
                 "the last gap between commits was %dx the median — it didn't die, it drifted"
@@ -307,14 +340,167 @@ def fmt_date(ts):
     return datetime.fromtimestamp(ts).strftime("%b %Y")
 
 
+def load_state(path):
+    """Load and validate the small persistent state file.
+
+    A bad state file must not make the read-only scan unusable. Invalid entries
+    are ignored with a warning and the rest of the state is preserved.
+    """
+    state = {"resurrections": [], "last_scan": None}
+    if not path:
+        return state
+    expanded = os.path.expanduser(path)
+    if not os.path.exists(expanded):
+        return state
+    try:
+        with open(expanded, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if not isinstance(loaded, dict):
+            raise ValueError("top level must be an object")
+        if isinstance(loaded.get("last_scan"), dict) or loaded.get("last_scan") is None:
+            state["last_scan"] = loaded.get("last_scan")
+        raw_resurrections = loaded.get("resurrections", [])
+        if not isinstance(raw_resurrections, list):
+            raise ValueError("resurrections must be a list")
+        for item in raw_resurrections:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            target = str(Path(os.path.expanduser(item["path"])).resolve())
+            date = item.get("date") if isinstance(item.get("date"), str) else "unknown"
+            name = item.get("name") if isinstance(item.get("name"), str) else Path(target).name
+            resurrection = {"path": target, "name": name, "date": date}
+            if isinstance(item.get("marked_at"), (int, float)):
+                resurrection["marked_at"] = item["marked_at"]
+            state["resurrections"].append(resurrection)
+    except (OSError, ValueError, TypeError) as exc:
+        print("warning: could not read state file %s (%s); starting fresh"
+              % (path, exc), file=sys.stderr)
+    return state
+
+
+def atomic_json_dump(path, data):
+    """Atomically write JSON, creating an explicitly requested parent dir."""
+    target = Path(os.path.expanduser(path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(target.parent),
+                                         prefix=".%s." % target.name, suffix=".tmp",
+                                         delete=False) as handle:
+            temp_name = handle.name
+            json.dump(data, handle, indent=1, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, str(target))
+    except Exception:
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        raise
+
+
+def public_repo(repo, fields):
+    """Pick JSON-safe public fields from an analyzed repository."""
+    return {key: repo[key] for key in fields if key in repo}
+
+
+def build_report(args, alive, finished, dead, unversioned, skipped, empty):
+    """Build the stable machine-readable report payload."""
+    alive_fields = ("name", "path", "first", "last", "commits", "mine", "ownership_known")
+    dead_exclusions = {"messages", "gaps", "last_touched", "real_name", "real_path"}
+    redacted_unversioned = [
+        {"name": "unversioned-%d" % i, "path": "(redacted)"}
+        for i, _item in enumerate(unversioned, 1)
+    ]
+    public_dead = []
+    for repo in dead:
+        item = {key: value for key, value in repo.items() if key not in dead_exclusions}
+        # A remote normally contains the owner and original repository name, so
+        # retaining it would undo --redact even when name/path are masked.
+        if args.redact and item.get("remote"):
+            item["remote"] = "(redacted)"
+        public_dead.append(item)
+    return {
+        "schema_version": 1,
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "days_threshold": args.days,
+        "census": {
+            "scanned": len(alive) + len(finished) + len(dead) + len(skipped) + len(empty),
+            "alive": len(alive),
+            "finished": len(finished),
+            "dead": len(dead),
+            "foreign_skipped": len(skipped),
+            "ownership_unknown": sum(
+                1 for repo in alive + finished + dead if not repo.get("ownership_known")
+            ),
+            "unversioned": len(unversioned),
+            "empty": len(empty),
+        },
+        "alive": [public_repo(repo, alive_fields) for repo in alive],
+        "finished": [public_repo(repo, alive_fields) for repo in finished],
+        "unversioned": (redacted_unversioned if args.redact else
+                          [{"name": item.name, "path": str(item)} for item in unversioned]),
+        "empty": ([{"name": "empty-%d" % i, "path": "(redacted)"}
+                   for i, _item in enumerate(empty, 1)] if args.redact else
+                  [{"name": item.name, "path": str(item)} for item in empty]),
+        "skipped": ([{"name": "not-yours-%d" % i} for i, _item in enumerate(skipped, 1)]
+                    if args.redact else [{"name": item["name"], "mine": item["mine"],
+                                          "commits": item["commits"]} for item in skipped]),
+        "dead": public_dead,
+    }
+
+
+def scan_snapshot(roots, alive, finished, dead, unversioned, empty):
+    """Create the private, unredacted scan snapshot stored for later matching."""
+    return {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "roots": [str(root) for root in roots],
+        "dead": [{"name": repo.get("real_name", repo["name"]),
+                  "path": repo.get("real_path", repo["path"]),
+                  "cause": repo["causes"][0][0], "pulse": repo["pulse"]}
+                 for repo in dead],
+        "alive": [{"name": repo.get("real_name", repo["name"]),
+                   "path": repo.get("real_path", repo["path"])} for repo in alive],
+        "finished": [{"name": repo.get("real_name", repo["name"]),
+                      "path": repo.get("real_path", repo["path"])} for repo in finished],
+        "unversioned": [{"name": item.name, "path": str(item)} for item in unversioned],
+        "empty": [{"name": item.name, "path": str(item)} for item in empty],
+    }
+
+
+def resurrection_reference_time(resurrection):
+    """Return an exact mark time while remaining compatible with legacy state."""
+    try:
+        day_time = datetime.strptime(resurrection.get("date", ""), "%Y-%m-%d").timestamp()
+    except (TypeError, ValueError, OverflowError):
+        day_time = None
+    marked_at = resurrection.get("marked_at")
+    if isinstance(marked_at, (int, float)):
+        # If somebody edited an old state's date, honor that explicit change.
+        # Otherwise use the exact timestamp to avoid treating a commit from the
+        # morning of resurrection day as post-resurrection activity.
+        marked_day = datetime.fromtimestamp(marked_at).strftime("%Y-%m-%d")
+        if marked_day == resurrection.get("date"):
+            return marked_at
+    if day_time is not None:
+        return day_time
+    return datetime.now().timestamp()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Find your dead side projects and why they died.")
     ap.add_argument("roots", nargs="*", default=None, help="directories to scan (default: common dev dirs)")
+    ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     ap.add_argument("--days", type=int, default=45, help="no commits in N days = dead (default 45)")
     ap.add_argument("--json", metavar="PATH", help="write full machine-readable report")
     ap.add_argument("--include-foreign", action="store_true",
                     help="include repos where you authored <20%% of commits (clones, forks, work checkouts)")
     ap.add_argument("--max", type=int, default=60, dest="max_repos", help="stop after N repos (default 60)")
+    ap.add_argument("--max-depth", type=int, default=MAX_DEPTH,
+                    help="directory levels below each root to inspect (default %d)" % MAX_DEPTH)
     ap.add_argument("--redact", action="store_true",
                     help="replace project names with project-1..n (for sharing the report)")
     ap.add_argument("--me", action="append", default=[], metavar="EMAIL",
@@ -330,44 +516,87 @@ def main(argv=None):
                     help="record that PATH was resurrected today (requires --state); "
                          "future scans call it out if it starts dying again.")
     args = ap.parse_args(argv)
+    if args.days < 0:
+        ap.error("--days must be zero or greater")
+    if args.max_repos < 1:
+        ap.error("--max must be at least 1")
+    if args.max_depth < 0:
+        ap.error("--max-depth must be zero or greater")
+    if (args.json and args.state
+            and Path(os.path.expanduser(args.json)).resolve()
+            == Path(os.path.expanduser(args.state)).resolve()):
+        ap.error("--json and --state must use different files")
 
-    state = {"resurrections": [], "last_scan": None}
-    if args.state and os.path.exists(args.state):
-        try:
-            state.update(json.load(open(args.state)))
-        except (OSError, ValueError):
-            print("warning: could not read state file %s; starting fresh" % args.state,
-                  file=sys.stderr)
+    state = load_state(args.state)
 
     if args.mark_resurrected:
         if not args.state:
             print("error: --mark-resurrected needs --state FILE to write into", file=sys.stderr)
             return 2
-        target = str(Path(os.path.expanduser(args.mark_resurrected)).resolve())
-        state["resurrections"] = [r for r in state["resurrections"] if r["path"] != target]
-        state["resurrections"].append({"path": target, "name": Path(target).name,
-                                       "date": datetime.now().strftime("%Y-%m-%d")})
-        with open(args.state, "w") as f:
-            json.dump(state, f, indent=1)
+        candidate = Path(os.path.expanduser(args.mark_resurrected)).resolve()
+        if not candidate.is_dir():
+            print("error: resurrection path is not a directory: %s" % candidate,
+                  file=sys.stderr)
+            return 2
+        top_level = sh(["git", "rev-parse", "--show-toplevel"], cwd=candidate)
+        if not top_level:
+            print("error: resurrection path is not inside a Git worktree: %s" % candidate,
+                  file=sys.stderr)
+            return 2
+        target = str(Path(top_level).resolve())
+        state["resurrections"] = [item for item in state["resurrections"]
+                                  if item["path"] != target]
+        marked_now = datetime.now()
+        state["resurrections"].append({
+            "path": target,
+            "name": Path(target).name,
+            "date": marked_now.strftime("%Y-%m-%d"),
+            "marked_at": int(marked_now.timestamp()),
+        })
+        try:
+            atomic_json_dump(args.state, state)
+        except OSError as exc:
+            print("error: could not write state file %s: %s" % (args.state, exc),
+                  file=sys.stderr)
+            return 2
+        display_name = "project" if args.redact else Path(target).name
         print("recorded: %s resurrected %s. The next scan holds it to that."
-              % (Path(target).name, state["resurrections"][-1]["date"]))
+              % (display_name, state["resurrections"][-1]["date"]))
         return 0
 
     roots = args.roots or DEFAULT_ROOTS
-    my_emails = {e.lower() for e in filter(None, [
-        sh(["git", "config", "--global", "user.email"]),
-        sh(["git", "config", "user.email"]),
-    ])} | {e.strip().lower() for e in args.me if e.strip()}
+    configured = []
+    for command in (["git", "config", "--global", "--get-all", "user.email"],
+                    ["git", "config", "--get-all", "user.email"]):
+        configured.extend(sh(command).splitlines())
+    my_emails = {email.strip().lower() for email in configured + args.me if email.strip()}
 
-    paths = find_repos(roots)
-    unversioned = find_unversioned(roots, paths)
+    paths = find_repos(roots, args.max_depth)
+    unversioned = find_unversioned(roots, paths, args.max_depth)
     if not paths:
-        print("No git repos found under: %s" % ", ".join(roots))
+        if args.redact:
+            print("No git repos found under the configured scan roots.")
+        else:
+            print("No git repos found under: %s" % ", ".join(str(root) for root in roots))
         if unversioned:
-            print("But %d project folder(s) with no git at all: %s"
-                  % (len(unversioned), ", ".join(p.name for p in unversioned[:8])))
+            if args.redact:
+                print("But %d project folder(s) with no git at all." % len(unversioned))
+            else:
+                print("But %d project folder(s) with no git at all: %s"
+                      % (len(unversioned), ", ".join(p.name for p in unversioned[:8])))
             print("No history means no autopsy — get them under git before they rot further.")
         print("Pass the directories where your projects actually live.")
+        report = build_report(args, [], [], [], unversioned, [], [])
+        try:
+            if args.json:
+                atomic_json_dump(args.json, report)
+                print("full report written" if args.redact else "full report: %s" % args.json)
+            if args.state:
+                state["last_scan"] = scan_snapshot(roots, [], [], [], unversioned, [])
+                atomic_json_dump(args.state, state)
+        except OSError as exc:
+            print("error: could not write requested output: %s" % exc, file=sys.stderr)
+            return 2
         return 1
     if len(paths) > args.max_repos:
         print("(found %d repos; reading the first %d — raise --max to widen)"
@@ -377,15 +606,18 @@ def main(argv=None):
     if len(paths) > 15:
         print("reading %d repos (a few seconds each on big histories)..." % len(paths),
               file=sys.stderr)
-    repos, skipped = [], []
-    for p in paths:
-        r = read_repo(p, my_emails)
-        if r is None:
+    repos, skipped, empty = [], [], []
+    for path in paths:
+        repo = read_repo(path, my_emails)
+        if repo is None:
+            empty.append(path)
             continue
-        if not args.include_foreign and my_emails and r["mine"] / r["commits"] < 0.2:
-            skipped.append("%s (%d/%d commits yours)" % (r["name"], r["mine"], r["commits"]))
+        if (not args.include_foreign and repo["ownership_known"]
+                and repo["mine"] / repo["commits"] < 0.2):
+            skipped.append({"name": repo["name"], "path": repo["path"],
+                            "mine": repo["mine"], "commits": repo["commits"]})
             continue  # someone else's repo you cloned; not your corpse to bury
-        repos.append(r)
+        repos.append(repo)
     foreign = len(skipped)
 
     if args.redact:
@@ -417,7 +649,7 @@ def main(argv=None):
         r["lifespan_days"] = lifespan_days(r)
 
     # ---- census ----
-    total_days = sum(r["lifespan_days"] for r in dead)
+    total_days = sum(repo["lifespan_days"] for repo in dead)
     print()
     if not args.no_art:
         print("          .--------.")
@@ -432,13 +664,28 @@ def main(argv=None):
     print("GRAVEYARD REPORT · %s" % datetime.now().strftime("%Y-%m-%d"))
     print("=" * 60)
     print("repos scanned: %d   alive: %d   finished: %d   dead: %d   not yours (skipped): %d"
-          % (len(repos) + foreign, len(alive), len(finished), len(dead), foreign))
+          % (len(repos) + foreign + len(empty), len(alive), len(finished), len(dead), foreign))
+    ownership_unknown = sum(1 for repo in repos if not repo["ownership_known"])
+    if ownership_unknown and not args.include_foreign:
+        print("ownership unknown for %d repo(s): no matching Git email was configured; "
+              "included them (use --me EMAIL for reliable filtering)" % ownership_unknown)
+    if empty:
+        if args.redact:
+            print("empty repositories (no commits): %d" % len(empty))
+        else:
+            print("empty repositories (no commits): %s"
+                  % ", ".join(path.name for path in empty[:8])
+                  + (" …" if len(empty) > 8 else ""))
     if finished:
         print("finished (shipped, just stable — not corpses): %s"
-              % ", ".join(r["name"] for r in finished[:8]))
+              % ", ".join(repo["name"] for repo in finished[:8]))
     if skipped:
-        print("skipped as not-yours (by commit email): %s" % ", ".join(s.split(" (")[0] for s in skipped[:10])
-              + (" …" if len(skipped) > 10 else ""))
+        if args.redact:
+            print("skipped as not-yours (by commit email): %d repository(s)" % len(skipped))
+        else:
+            print("skipped as not-yours (by commit email): %s"
+                  % ", ".join(item["name"] for item in skipped[:10])
+                  + (" …" if len(skipped) > 10 else ""))
         print("  (yours under another email? rerun with --me that@email.com, or --include-foreign)")
     if unversioned:
         if args.redact:
@@ -446,108 +693,118 @@ def main(argv=None):
                   % len(unversioned))
         else:
             print("unversioned (no git — died before their first commit): %s"
-                  % ", ".join(p.name for p in unversioned[:8])
+                  % ", ".join(path.name for path in unversioned[:8])
                   + (" …" if len(unversioned) > 8 else ""))
         print("  no history means no autopsy; `git init` is the only medicine here")
-    if not dead:
+
+    if dead:
+        print("combined lifespan of the dead: ~%d day%s of your life"
+              % (total_days, "" if total_days == 1 else "s"))
+        oldest = min(dead, key=lambda repo: repo["last"])
+        print("oldest corpse: %s (silent since %s)"
+              % (oldest["name"], fmt_date(oldest["last"])))
+
+        # ---- the dead ----
+        print("\nTHE DEAD" + " " * 24 + "lived      commits  cause of death")
+        print("-" * 60)
+        for repo in dead:
+            cause = repo["causes"][0][0].replace("_", " ")
+            print("%-30s %4dd %9d   %s"
+                  % (repo["name"][:30], repo["lifespan_days"], repo["commits"], cause))
+
+        # ---- patterns ----
+        print("\nPATTERNS")
+        print("-" * 60)
+        spans = [repo["lifespan_days"] for repo in dead]
+        med_span = statistics.median(spans)
+        med_text = (str(int(med_span)) if med_span == int(med_span)
+                    else "%.1f" % med_span)
+        print("- median lifespan of a dead project: %s day%s"
+              % (med_text, "" if med_span == 1 else "s"))
+        burst = [repo for repo in dead
+                 if repo["lifespan_days"] <= 1 and repo["commits"] >= 5]
+        if len(burst) >= 2:
+            print("- %d projects lived exactly one day: built in a single burst, never reopened."
+                  % len(burst))
+        shiny = [repo for repo in dead if repo["causes"][0][0] == "shiny_object"]
+        if shiny:
+            print("- %d of %d were killed by a newer project. You don't abandon projects;"
+                  % (len(shiny), len(dead)))
+            print("  you leave them for younger ones.")
+        walls = [repo for repo in dead
+                 if repo["causes"][0][0] in ("auth_wall", "payments_wall")]
+        if len(walls) >= 2:
+            print("- %d projects died at the same wall (auth/payments). That wall isn't moving;"
+                  % len(walls))
+            print("  your approach to it has to.")
+        fear = [repo for repo in dead
+                if any(cause[0] == "deploy_fear" for cause in repo["causes"])]
+        if fear:
+            print("- %d finished project(s) never shipped. Building was never the problem."
+                  % len(fear))
+    else:
         print("\nNo corpses. Either you finish everything or you delete the evidence.")
-        return 0
-    print("combined lifespan of the dead: ~%d days of your life" % total_days)
-    oldest = min(dead, key=lambda r: r["last"])
-    print("oldest corpse: %s (silent since %s)" % (oldest["name"], fmt_date(oldest["last"])))
-
-    # ---- the dead ----
-    print("\nTHE DEAD" + " " * 24 + "lived      commits  cause of death")
-    print("-" * 60)
-    for r in dead:
-        cause = r["causes"][0][0].replace("_", " ")
-        print("%-30s %4dd %9d   %s" % (r["name"][:30], r["lifespan_days"], r["commits"], cause))
-
-    # ---- patterns ----
-    print("\nPATTERNS")
-    print("-" * 60)
-    spans = [r["lifespan_days"] for r in dead]
-    med_span = statistics.median(spans)
-    print("- median lifespan of a dead project: %d day%s" % (med_span, "" if med_span == 1 else "s"))
-    burst = [r for r in dead if r["lifespan_days"] <= 1 and r["commits"] >= 5]
-    if len(burst) >= 2:
-        print("- %d projects lived exactly one day: built in a single burst, never reopened." % len(burst))
-    shiny = [r for r in dead if r["causes"][0][0] == "shiny_object"]
-    if shiny:
-        print("- %d of %d were killed by a newer project. You don't abandon projects;"
-              % (len(shiny), len(dead)))
-        print("  you leave them for younger ones.")
-    walls = [r for r in dead if r["causes"][0][0] in ("auth_wall", "payments_wall")]
-    if len(walls) >= 2:
-        print("- %d projects died at the same wall (auth/payments). That wall isn't moving;" % len(walls))
-        print("  your approach to it has to.")
-    fear = [r for r in dead if any(c[0] == "deploy_fear" for c in r["causes"])]
-    if fear:
-        print("- %d finished project(s) never shipped. Building was never the problem." % len(fear))
 
     # ---- relapse watch: hold past resurrections to their promise ----
     if state["resurrections"]:
-        by_path = {r.get("real_path", r["path"]): r for r in repos}
+        by_path = {repo.get("real_path", repo["path"]): repo for repo in repos}
         lines = []
-        for res in state["resurrections"]:
-            r = by_path.get(res["path"])
-            if r is None:
+        now = datetime.now().timestamp()
+        for index, resurrection in enumerate(state["resurrections"], 1):
+            repo = by_path.get(resurrection["path"])
+            display = ("resurrected-project-%d" % index if args.redact
+                       else resurrection["name"])
+            if repo is None:
                 lines.append("- %s: resurrected %s, no longer found on disk. Buried for good, or moved."
-                             % (res["name"], res["date"]))
+                             % (display, resurrection["date"]))
                 continue
-            silent_days = int((datetime.now().timestamp() - r["last"]) / 86400)
-            if silent_days > 14:
-                lines.append("- %s: resurrected %s, silent for %d days since. It's dying again — "
-                             "decide: recommit or bury it honestly." % (res["name"], res["date"], silent_days))
+            if args.redact:
+                display = repo["name"]
+            marked = resurrection_reference_time(resurrection)
+            latest_activity = max(marked, repo["last"])
+            silent_seconds = max(0, now - latest_activity)
+            silent_days = int(silent_seconds / 86400)
+            if silent_seconds > 14 * 86400:
+                lines.append("- %s: resurrected %s, no activity for %d days. It's dying again — "
+                             "decide: recommit or bury it honestly."
+                             % (display, resurrection["date"], silent_days))
+            elif repo["last"] < marked:
+                lines.append("- %s: resurrected %s, awaiting its first new commit (%dd). Holding."
+                             % (display, resurrection["date"], silent_days))
             else:
                 lines.append("- %s: resurrected %s, last commit %dd ago. Holding."
-                             % (res["name"], res["date"], silent_days))
+                             % (display, resurrection["date"], silent_days))
         print("\nRELAPSE WATCH")
         print("-" * 60)
-        for l in lines:
-            print(l)
+        for line in lines:
+            print(line)
 
     # ---- pulse ----
-    print("\nSTRONGEST PULSE --------/\\_/\\-------- (most resurrectable)")
-    print("-" * 60)
-    for r in sorted(dead, key=lambda r: r["pulse"], reverse=True)[:3]:
-        print("%-30s pulse %d/100" % (r["name"][:30], r["pulse"]))
-        print("   evidence: %s" % ("; ".join(r["pulse_why"]) or "not much"))
-        print("   cause:    %s" % r["causes"][0][1])
-        if r["missing"]:
-            print("   to ship:  needs %s" % ", ".join(r["missing"]))
+    if dead:
+        print("\nSTRONGEST PULSE --------/\\_/\\-------- (most resurrectable)")
+        print("-" * 60)
+        for repo in sorted(dead, key=lambda item: item["pulse"], reverse=True)[:3]:
+            print("%-30s pulse %d/100" % (repo["name"][:30], repo["pulse"]))
+            print("   evidence: %s" % ("; ".join(repo["pulse_why"]) or "not much"))
+            print("   cause:    %s" % repo["causes"][0][1])
+            if repo["missing"]:
+                print("   to ship:  needs %s" % ", ".join(repo["missing"]))
     print()
 
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump({"generated": datetime.now().isoformat(timespec="seconds"),
-                       "days_threshold": args.days,
-                       "alive": [{k: r[k] for k in ("name", "path", "last", "commits")} for r in alive],
-                       "finished": [{k: r[k] for k in ("name", "path", "last", "commits")} for r in finished],
-                       "unversioned": [{"name": "unversioned-%d" % i, "path": "(redacted)"}
-                                       if args.redact else {"name": u.name, "path": str(u)}
-                                       for i, u in enumerate(unversioned, 1)],
-                       "dead": [{k: r[k] for k in r
-                                 if k not in ("messages", "gaps", "last_touched", "real_name", "real_path")}
-                                for r in dead]}, f, indent=1)
-        print("full report: %s" % args.json)
-
-    if args.state:
-        # The state file is a local resume artifact, not the shared report, so it
-        # always records the real names/paths even under --redact.
-        state["last_scan"] = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "roots": [str(r) for r in roots],
-            "dead": [{"name": r.get("real_name", r["name"]), "path": r.get("real_path", r["path"]),
-                      "cause": r["causes"][0][0], "pulse": r["pulse"]} for r in dead],
-            "alive": [{"name": r.get("real_name", r["name"]), "path": r.get("real_path", r["path"])}
-                      for r in alive],
-            "finished": [{"name": r.get("real_name", r["name"]), "path": r.get("real_path", r["path"])}
-                         for r in finished],
-            "unversioned": [{"name": u.name, "path": str(u)} for u in unversioned],
-        }
-        with open(args.state, "w") as f:
-            json.dump(state, f, indent=1)
+    report = build_report(args, alive, finished, dead, unversioned, skipped, empty)
+    try:
+        if args.json:
+            atomic_json_dump(args.json, report)
+            print("full report written" if args.redact else "full report: %s" % args.json)
+        if args.state:
+            # The state file is private resume data, so real names and paths are
+            # retained even when the shareable report is redacted.
+            state["last_scan"] = scan_snapshot(
+                roots, alive, finished, dead, unversioned, empty)
+            atomic_json_dump(args.state, state)
+    except OSError as exc:
+        print("error: could not write requested output: %s" % exc, file=sys.stderr)
+        return 2
     return 0
 
 
